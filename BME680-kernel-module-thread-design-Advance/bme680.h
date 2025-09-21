@@ -14,6 +14,12 @@
 #include <linux/hwmon.h>
 #include <linux/netlink.h>
 #include <linux/rcupdate.h>
+#include <linux/iio/buffer.h>
+#include <linux/iio/trigger.h>
+#include <linux/completion.h>
+#include <linux/shmem_fs.h>
+#include <linux/msg.h>
+#include <linux/timer.h>
 
 typedef enum {
     BME680_MODE_SLEEP = 0,
@@ -96,6 +102,27 @@ typedef enum {
 #define BME680_STARTUP_TIME_US 2000
 #define BME680_NUM_CHANNELS 4
 #define BME680_NUM_BULK_READ_REGS 15
+#define BME680_REG_CTRL_GAS_0 0x70
+#define BME680_REG_VARIANT_ID 0xF0
+#define BME680_SOFT_RESET_VAL 0xB6
+#define BME680_STATUS_GAS_VALID_MSK 0x20
+#define BME680_GAS_MEAS_MSK 0x30
+#define BME680_NBCONV_MSK 0x0F
+#define BME680_RUN_GAS_POS 4
+#define BME680_FILTER_POS 2
+#define BME680_OST_MSK 0xE0
+#define BME680_OST_POS 5
+#define BME680_OSP_MSK 0x1C
+#define BME680_OSP_POS 2
+#define BME680_OSH_MSK 0x07
+#define BME680_GAS_SENSOR_NB_CONV_MIN 0
+#define BME680_GAS_SENSOR_NB_CONV_MAX 10
+#define BME680_GAS_WAIT_SHARED_MSK 0x3F
+#define BME680_CALIB1_RANGE_1 0xDF
+#define BME680_CALIB1_RANGE_2 0x8A
+#define BME680_CALIB2_RANGE_1 0xE1
+#define BME680_CALIB2_RANGE_2 0xF0
+
 
 struct bme680_calib {
     uint16_t par_t1;
@@ -189,15 +216,38 @@ struct bme680_data {
     struct bme680_fifo_data fifo_data;
     struct device *hwmon_dev;
     uint32_t gas_threshold;
+	struct iio_trigger *trig;
+    struct kthread_worker poll_worker;
+    struct kthread_work poll_work;
+    struct completion data_ready;
+    struct netlink_capability *netlink;
+    struct hwmon_device *hwmon;
+    struct file *ipc_shm;
+    int ipc_msgid;
+    struct timer_list threshold_timer;
+    u32 threshold_temp;
+    u32 threshold_press;
+    u32 threshold_hum;
+    uint8_t heater_temp; /* Thêm trường này, trùng tên nhưng cần đảm bảo không xung đột */
+    uint8_t variant_id;
 };
 
 #define BME680_IOC_MAGIC 'B'
 #define BME680_IOC_SET_GAS_CONFIG _IOW(BME680_IOC_MAGIC, 1, struct bme680_gas_config)
 #define BME680_IOC_READ_FIFO _IOR(BME680_IOC_MAGIC, 2, struct bme680_fifo_data)
 #define BME680_IOC_GET_SHM _IOR(BME680_IOC_MAGIC, 3, unsigned long)
+#define BME680_IOC_SET_HEATER_TEMP _IOW(BME680_IOC_MAGIC, 1, u8)
+#define BME680_IOC_SET_HEATER_DUR _IOW(BME680_IOC_MAGIC, 2, u16)
+#define BME680_IOC_GET_IAQ _IOR(BME680_IOC_MAGIC, 4, u32)
+#define BME680_IOC_SET_THRESHOLD_TEMP _IOW(BME680_IOC_MAGIC, 5, u32)
+#define BME680_IOC_SET_THRESHOLD_PRESS _IOW(BME680_IOC_MAGIC, 6, u32)
+#define BME680_IOC_SET_THRESHOLD_HUM _IOW(BME680_IOC_MAGIC, 7, u32)
+#define BME680_IOC_SET_THRESHOLD_GAS _IOW(BME680_IOC_MAGIC, 8, u32)
+
 
 extern const struct iio_chan_spec bme680_channels[];
 extern const struct regmap_config bme680_regmap_config;
+extern struct mutex bme680_i2c_lock;
 int bme680_core_probe(struct device *dev, struct regmap *regmap, const char *name, void *bus_data);
 int bme680_core_remove(struct device *dev);
 int bme680_read_raw(struct iio_dev *indio_dev, struct iio_chan_spec const *chan, int *val, int *val2, long mask);
@@ -212,5 +262,7 @@ void bme680_send_netlink_alert(struct bme680_data *data, const char *msg);
 void bme680_check_threshold(struct bme680_data *data);
 int bme680_ipc_init(struct bme680_data *data);
 void bme680_ipc_cleanup(struct bme680_data *data);
+int bme680_core_suspend(struct bme680_data *data);
+int bme680_core_resume(struct bme680_data *data);
 
 #endif /* _BME680_H_ */

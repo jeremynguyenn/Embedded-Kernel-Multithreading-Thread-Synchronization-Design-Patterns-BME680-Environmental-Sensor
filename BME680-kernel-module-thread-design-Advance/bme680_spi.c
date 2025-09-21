@@ -10,12 +10,14 @@
 #include <linux/lockdep.h> // Thêm lockdep
 
 #include "bme680.h"
-
+#include <linux/of_device.h>
 struct bme680_spi_bus_context {
     struct spi_device *spi;
     u8 current_page;
 };
-
+/* Thêm biến mutex và lockdep key */
+static DEFINE_MUTEX(bme680_spi_lock);
+static struct lock_class_key bme680_spi_lock_key;
 /*
  * In SPI mode there are only 7 address bits, a "page" register determines
  * which part of the 8-bit range is active. This function looks at the address
@@ -60,6 +62,15 @@ static int bme680_regmap_spi_select_page(
     return 0;
 }
 
+/* Thêm cấu hình regmap */
+static const struct regmap_config bme680_spi_regmap_config = {
+    .reg_bits = 8,
+    .val_bits = 8,
+    .max_register = 0xFF,
+    .use_single_read = true,
+    .use_single_write = true,
+};
+
 static int bme680_regmap_spi_write(void *context, const void *data,
     size_t count)
 {
@@ -99,6 +110,78 @@ static int bme680_regmap_spi_read(void *context, const void *reg,
 
     return spi_write_then_read(spi, txbuf: &addr, n_tx: 1, rxbuf: val, n_rx: val_size);
 }
+static int bme680_spi_reg_read(void *context, unsigned int reg, unsigned int *val)
+{
+    struct bme680_spi_bus_context *ctx = context;
+    struct spi_device *spi = ctx->spi;
+    u8 tx_buf[2] = {reg | 0x80, 0};
+    u8 rx_buf[2];
+    int ret;
+
+    lockdep_assert_held(&bme680_spi_lock);
+
+    ret = spi_write_then_read(spi, tx_buf, 1, rx_buf, 1);
+    if (ret < 0) {
+        dev_err(&spi->dev, "Failed to read register 0x%02x: %d\n", reg, ret);
+        return ret;
+    }
+
+    *val = rx_buf[0];
+    return 0;
+}
+
+/* Thêm hàm bme680_spi_reg_write */
+static int bme680_spi_reg_write(void *context, unsigned int reg, unsigned int val)
+{
+    struct bme680_spi_bus_context *ctx = context;
+    struct spi_device *spi = ctx->spi;
+    u8 buf[2] = {reg & ~0x80, val};
+    int ret;
+
+    lockdep_assert_held(&bme680_spi_lock);
+
+    ret = spi_write(spi, buf, 2);
+    if (ret < 0) {
+        dev_err(&spi->dev, "Failed to write register 0x%02x: %d\n", reg, ret);
+        return ret;
+    }
+
+    return 0;
+}
+
+/* Thêm hàm bme680_spi_remove */
+static int bme680_spi_remove(struct spi_device *spi)
+{
+    return bme680_core_remove(&spi->dev);
+}
+
+/* Thêm hàm bme680_spi_suspend */
+static int bme680_spi_suspend(struct device *dev)
+{
+    struct spi_device *spi = to_spi_device(dev);
+    struct bme680_data *data = spi_get_drvdata(spi);
+    mutex_lock(&bme680_spi_lock);
+    bme680_core_suspend(data);
+    mutex_unlock(&bme680_spi_lock);
+    return 0;
+}
+
+/* Thêm hàm bme680_spi_resume */
+static int bme680_spi_resume(struct device *dev)
+{
+    struct spi_device *spi = to_spi_device(dev);
+    struct bme680_data *data = spi_get_drvdata(spi);
+    mutex_lock(&bme680_spi_lock);
+    bme680_core_resume(data);
+    mutex_unlock(&bme680_spi_lock);
+    return 0;
+}
+
+/* Thêm cấu trúc dev_pm_ops */
+static const struct dev_pm_ops bme680_spi_pm_ops = {
+    .suspend = bme680_spi_suspend,
+    .resume = bme680_spi_resume,
+};
 
 static const struct regmap_bus bme680_regmap_bus = {
     .write = bme680_regmap_spi_write,

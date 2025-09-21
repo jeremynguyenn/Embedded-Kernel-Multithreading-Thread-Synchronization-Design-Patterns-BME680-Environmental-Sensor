@@ -36,6 +36,11 @@ install: module dt
 	echo "Add 'dtoverlay=bme680' to /boot/config.txt"
 
 test: install
+	# Add dependencies for object files
+	bme680_i2c.o: bme680.h
+	bme680_spi.o: bme680.h
+	bme680_ipc.o: bme680.h
+	bme680_core.o: bme680.h
 	if lsmod | grep -q bme680; then sudo rmmod bme680_core bme680_i2c bme680_spi bme680_ipc; fi
 	sudo insmod $(PWD)/bme680_core.ko
 	sudo insmod $(PWD)/bme680_i2c.ko

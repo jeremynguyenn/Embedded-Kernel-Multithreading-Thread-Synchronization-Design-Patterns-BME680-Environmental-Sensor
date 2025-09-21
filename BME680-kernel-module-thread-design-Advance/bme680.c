@@ -26,6 +26,14 @@
 #include <linux/unaligned.h>
 #include <linux/lockdep.h> // Thêm cho lockdep
 
+#include <linux/spinlock.h>
+#include <linux/rwlock.h>
+#include <linux/kthread.h>
+#include <linux/semaphore.h>
+#include <linux/completion.h>
+#include <linux/jiffies.h>
+#include <linux/timer.h>
+
 #include "bme680.h"
 
 /* 1st set of calibration data */
@@ -100,6 +108,13 @@ struct bme680_calib {
     s8 range_sw_err;
 };
 
+struct bme680_fifo_data {
+    s32 temp;
+    u32 pressure;
+    u32 humidity;
+    u32 gas_res;
+};
+
 static const char * const bme680_supply_names[] = { "vdd", "vddio" };
 
 struct bme680_data {
@@ -127,8 +142,23 @@ struct bme680_data {
     wait_queue_head_t poll_wq;
     kfifo_declare(bme680_fifo, struct iio_poll_func, 1);
     lockdep_map lockdep_map; // Thêm cho lockdep
+	
+	struct device *dev;
+    spinlock_t reg_lock;
+    rwlock_t calib_lock;
+    atomic_t read_count;
+    atomic_t error_count;
+    DECLARE_KFIFO(data_fifo, struct bme680_fifo_data, 1024);
+    struct semaphore fifo_sem;
+    struct timer_list threshold_timer;
+    u32 threshold_temp;
+    u32 threshold_press;
+    u32 threshold_hum;
+    u32 threshold_gas;
+    u8 chip_id;
+    u8 variant_id;
 };
-
+struct mutex bme680_i2c_lock;
 enum bme680_op_mode {
     BME680_MODE_SLEEP = 0,
     BME680_MODE_FORCED = 1,
@@ -192,6 +222,150 @@ static const struct iio_chan_spec bme680_channels[] = {
     },
     IIO_CHAN_SOFT_TIMESTAMP(4),
 };
+
+/* Thêm hàm bme680_poll_thread */
+static int bme680_poll_thread(void *arg)
+{
+    struct bme680_data *data = arg;
+    struct bme680_fifo_data fifo;
+    while (!kthread_should_stop()) {
+        mutex_lock(&data->lock);
+        if (bme680_read_raw_data(data, &fifo) == 0) {
+            down(&data->fifo_sem);
+            kfifo_put(&data->data_fifo, fifo);
+            up(&data->fifo_sem);
+            complete(&data->data_ready);
+        } else {
+            atomic_inc(&data->error_count);
+        }
+        mutex_unlock(&data->lock);
+        usleep_range(1000, 2000);
+    }
+    return 0;
+}
+
+/* Thêm hàm check_threshold_task */
+static void check_threshold_task(struct timer_list *t)
+{
+    struct bme680_data *data = from_timer(data, t, threshold_timer);
+    struct bme680_fifo_data fifo;
+    int ret;
+
+    down(&data->fifo_sem);
+    ret = kfifo_get(&data->data_fifo, &fifo);
+    up(&data->fifo_sem);
+    if (ret) {
+        if (fifo.temp > data->threshold_temp) bme680_netlink_send(data, "Temperature threshold exceeded");
+        if (fifo.pressure > data->threshold_press) bme680_netlink_send(data, "Pressure threshold exceeded");
+        if (fifo.humidity > data->threshold_hum) bme680_netlink_send(data, "Humidity threshold exceeded");
+        if (fifo.gas_res > data->threshold_gas) bme680_netlink_send(data, "Gas threshold exceeded");
+    }
+    mod_timer(&data->threshold_timer, jiffies + HZ);
+}
+
+/* Thêm hàm bme680_compensate_temp */
+static s32 bme680_compensate_temp(struct bme680_data *data, u32 adc_temp)
+{
+    s64 var1, var2, var3, calc_temp;
+
+    var1 = ((s64) adc_temp) / 16384 - ((s64) data->bme680.par_t1) * 2;
+    var2 = var1 * ((s64) data->bme680.par_t2);
+    var3 = (var1 / 2) * (var1 / 2) * ((s64) data->bme680.par_t3) / 1024;
+    data->bme680.t_fine = var2 + var3;
+    calc_temp = (data->bme680.t_fine * 5 + 128) / 256;
+    return calc_temp;
+}
+
+/* Thêm hàm bme680_compensate_press */
+static u32 bme680_compensate_press(struct bme680_data *data, u32 adc_press)
+{
+    s64 var1, var2, var3, var4, calc_press;
+
+    var1 = ((s64)data->bme680.t_fine / 2) - 64000;
+    var2 = var1 * var1 * ((s64)data->bme680.par_p6) / 32768;
+    var2 += var1 * ((s64)data->bme680.par_p5) * 2;
+    var2 = (var2 / 4) + (((s64)data->bme680.par_p4) * 65536);
+    var3 = (((s64)data->bme680.par_p3 * var1 * var1) / 524288 + ((s64)data->bme680.par_p2 * var1)) / 524288;
+    var4 = (1 + var3 / 32768) * ((s64)data->bme680.par_p1);
+    calc_press = 1048576 - adc_press;
+    calc_press = (calc_press - (var2 / 4096)) * 6250 / var4;
+    var1 = ((s64)data->bme680.par_p9 * calc_press * calc_press) / 2147483648;
+    var2 = calc_press * ((s64)data->bme680.par_p8) / 32768;
+    var3 = (calc_press / 256) * (calc_press / 256) * (calc_press / 256) * (data->bme680.par_p10 / 131072);
+    calc_press += (var1 + var2 + var3 + ((s64)data->bme680.par_p7 * 128)) / 16;
+    return calc_press;
+}
+
+/* Thêm hàm bme680_compensate_hum */
+static u32 bme680_compensate_hum(struct bme680_data *data, u32 adc_hum)
+{
+    s64 calc_hum, var1, var2, var3, var4, temp_comp;
+
+    temp_comp = ((s64)data->bme680.t_fine * 5 + 128) / 256;
+    var1 = (s64)(adc_hum - ((s64)(data->bme680.par_h1 * 16))) - (((temp_comp * (s64)data->bme680.par_h3) / 100) >> 1);
+    var2 = (s64)data->bme680.par_h2 * (((temp_comp * (s64)data->bme680.par_h4) / 100) + (((temp_comp * ((temp_comp * (s64)data->bme680.par_h5) / 100)) >> 6) / 100) + (1 << 14));
+    var3 = var1 * var2;
+    var4 = (((s64)data->bme680.par_h6 << 7) * ((temp_comp * (s64)data->bme680.par_h7) / 100)) >> 4;
+    var3 += var4;
+    calc_hum = (((var3 >> 14) * (var3 >> 14) * ((s64)data->bme680.par_h6) / 100) >> 1) / 4096;
+    calc_hum = var3 >> 14 - calc_hum;
+    calc_hum = (((calc_hum * 1000) >> 13) * 100) >> 12;
+    if (calc_hum > 100000) calc_hum = 100000;
+    if (calc_hum < 0) calc_hum = 0;
+    return calc_hum;
+}
+
+/* Thêm hàm bme680_compensate_gas */
+static u32 bme680_compensate_gas(struct bme680_data *data, u16 adc_gas, u8 const_array_idx)
+{
+    s64 var1, var2, var3, calc_gas_res;
+    u8 const_array1 = (const_array_idx & 0x0F) * 2;
+    u8 const_array2 = const_array1 + 1;
+    const u8 const_array[32] = {0,0,0,0,0,-1,0,-3,0,0,0,1,1,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+
+    var1 = (s64)((1340 + (5 * (s64)data->bme680.range_sw_err)) * ((s64) const_array[const_array1])) / 65536;
+    var2 = (((s64)((adc_gas * 32768) - (16777216))) * ((s64) const_array[const_array2])) / 4096;
+    var3 = (((s64) data->bme680.res_heat_range * var2) / 4) + (var1 * 4);
+    calc_gas_res = (s64)(5 * var3) / 100;
+    return calc_gas_res;
+}
+
+/* Thêm hàm bme680_core_probe */
+int bme680_core_probe(struct device *dev, struct regmap *regmap, const char *name)
+{
+    int ret;
+    mutex_lock(&bme680_i2c_lock);
+    ret = bme680_probe(dev, regmap, name);
+    mutex_unlock(&bme680_i2c_lock);
+    return ret;
+}
+
+/* Thêm hàm bme680_core_remove */
+int bme680_core_remove(struct device *dev)
+{
+    struct bme680_data *data = iio_priv(to_iio_dev(dev));
+    mutex_lock(&bme680_i2c_lock);
+    del_timer_sync(&data->threshold_timer);
+    kthread_stop(data->poll_thread);
+    mutex_unlock(&bme680_i2c_lock);
+    return 0;
+}
+
+/* Thêm hàm bme680_core_suspend */
+int bme680_core_suspend(struct bme680_data *data)
+{
+    mutex_lock(&data->lock);
+    mutex_unlock(&data->lock);
+    return 0;
+}
+
+/* Thêm hàm bme680_core_resume */
+int bme680_core_resume(struct bme680_data *data)
+{
+    mutex_lock(&data->lock);
+    mutex_unlock(&data->lock);
+    return 0;
+}
 
 static int bme680_read_calib(struct bme680_data *data, struct bme680_calib *calib)
 {

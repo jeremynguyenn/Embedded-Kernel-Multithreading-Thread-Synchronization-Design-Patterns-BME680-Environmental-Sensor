@@ -28,6 +28,7 @@
 #include "deadlock_detector.h"
 #include "dining_philosophers.h"
 #include "barrier.h"
+#include <time.h>
 
 // Định nghĩa structs và functions để tích hợp kernel interaction (user-space app gọi kernel module qua /dev/i2c or char device)
 struct bme680_dev {
@@ -35,6 +36,21 @@ struct bme680_dev {
     uint8_t addr; // I2C address
     struct bme680_config config; // Config từ bme680_config.h
 };
+/* Thêm các biến toàn cục */
+static assembly_line_t *assembly_line;
+static thread_pool_t *thread_pool;
+static bme680_monitor_t *monitor;
+static timer_t *timer;
+static fork_handler_t *fork_handler;
+static ipc_sync_t *ipc_sync;
+static barrier_t *barrier;
+static dining_philosophers_t *dining_philosophers;
+static rwlock_t *rwlock;
+static recursive_mutex_t *recursive_mutex;
+static deadlock_detector_t *deadlock_detector;
+static fifo_semaphore_t *fifo_semaphore;
+static event_pair_t *event_pair;
+static int fd;
 
 static int bme680_dev_init(const char *dev_path, uint8_t addr) {
     struct bme680_dev *dev = malloc(sizeof(struct bme680_dev));
@@ -121,6 +137,17 @@ static void app_cleanup(void *arg) {
     bme680_dev_destroy(app->dev);
     pubsub_destroy();
     logger_destroy();
+}
+
+static void event_loop(void)
+{
+    struct bme680_fifo_data data;
+    while (1) {
+        fifo_semaphore_wait(fifo_semaphore);
+        bme680_monitor_read(monitor, &data);
+        thread_pool_enqueue(thread_pool, process_data, &data);
+        pubsub_publish("sensor_data", &data, sizeof(data));
+    }
 }
 
 static void process_data(void *arg) {

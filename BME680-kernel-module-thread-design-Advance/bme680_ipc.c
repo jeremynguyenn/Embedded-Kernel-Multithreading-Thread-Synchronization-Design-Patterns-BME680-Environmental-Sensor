@@ -8,6 +8,7 @@
 #include "bme680.h"
 #include "timer.h"
 #include <linux/lockdep.h> // Thêm lockdep
+#include <linux/shmem_fs.h>
 
 struct bme680_ipc_data {
     struct sock *nl_sk;
@@ -19,11 +20,61 @@ struct bme680_ipc_data {
 };
 
 static struct bme680_ipc_data *ipc_data;
+static struct lock_class_key bme680_ipc_lock_key;
 
 struct bme680_sysv_msg {
     long mtype;
     char mtext[64];
 };
+
+/* Thêm hàm bme680_netlink_send */
+static int bme680_netlink_send(struct bme680_data *data, const char *msg)
+{
+    struct sk_buff *skb;
+    struct nlmsghdr *nlh;
+    int len = strlen(msg) + 1;
+    int ret;
+
+    skb = nlmsg_new(len, GFP_KERNEL);
+    if (!skb) return -ENOMEM;
+
+    nlh = nlmsg_put(skb, 0, 0, NLMSG_DONE, len, 0);
+    if (!nlh) {
+        kfree_skb(skb);
+        return -EMSGSIZE;
+    }
+
+    memcpy(nlmsg_data(nlh), msg, len);
+    ret = netlink_unicast(data->netlink->sock, skb, data->netlink->pid, 0);
+    if (ret < 0) dev_err(data->dev, "Netlink send failed: %d\n", ret);
+    return ret;
+}
+
+/* Thêm hàm check_threshold_task mới */
+static void check_threshold_task(struct timer_list *t)
+{
+    struct bme680_data *data = from_timer(data, t, threshold_timer);
+    struct bme680_fifo_data fifo;
+    int ret, retries = 3;
+
+    lockdep_assert_held(&data->lock);
+
+    while (retries--) {
+        down(&data->fifo_sem);
+        ret = kfifo_get(&data->data_fifo, &fifo);
+        up(&data->fifo_sem);
+        if (ret) break;
+        usleep_range(1000, 2000); // Backoff
+    }
+    if (!ret) return;
+
+    if (fifo.temp > data->threshold_temp) bme680_netlink_send(data, "Temperature threshold exceeded");
+    if (fifo.pressure > data->threshold_press) bme680_netlink_send(data, "Pressure threshold exceeded");
+    if (fifo.humidity > data->threshold_hum) bme680_netlink_send(data, "Humidity threshold exceeded");
+    if (fifo.gas_res > data->threshold_gas) bme680_netlink_send(data, "Gas threshold exceeded");
+
+    mod_timer(&data->threshold_timer, jiffies + HZ);
+}
 
 void bme680_send_netlink_alert(struct bme680_data *data, const char *msg) {
     struct sk_buff *skb;
