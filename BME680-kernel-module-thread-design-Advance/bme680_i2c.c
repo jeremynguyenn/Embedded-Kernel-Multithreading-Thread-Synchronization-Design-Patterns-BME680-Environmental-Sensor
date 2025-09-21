@@ -193,4 +193,8 @@ module_exit(bme680_i2c_exit);
 
 MODULE_AUTHOR("Nguyen Trung Nhan");
 MODULE_DESCRIPTION("I2C driver for Bosch BME680 environmental sensor");
+<<<<<<< HEAD
 MODULE_LICENSE("GPL v2");
+=======
+MODULE_LICENSE("GPL v2");
+>>>>>>> fbef8e448de785642c225b948a797e384309931e
