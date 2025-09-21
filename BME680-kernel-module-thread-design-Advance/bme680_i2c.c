@@ -13,6 +13,7 @@
 #include <linux/of_device.h>
 #include <linux/lockdep.h>
 #include "bme680.h"
+#include <linux/delay.h>
 
 #define BME680_I2C_ADDRESS_DEFAULT 0x77
 

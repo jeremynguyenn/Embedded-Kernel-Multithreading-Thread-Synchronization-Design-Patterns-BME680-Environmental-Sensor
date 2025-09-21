@@ -29,7 +29,7 @@
 #include "dining_philosophers.h"
 #include "barrier.h"
 #include <time.h>
-
+#include <signal.h>
 // Định nghĩa structs và functions để tích hợp kernel interaction (user-space app gọi kernel module qua /dev/i2c or char device)
 struct bme680_dev {
     int fd; // File descriptor cho /dev/i2c-1 hoặc /dev/bme680
@@ -137,6 +137,12 @@ static void app_cleanup(void *arg) {
     bme680_dev_destroy(app->dev);
     pubsub_destroy();
     logger_destroy();
+}
+
+/* Thêm hàm signal_handler */
+static void signal_handler(int sig) {
+    logger_log(LOG_INFO, "Received signal %d, shutting down", sig);
+    app.running = 0;
 }
 
 static void event_loop(void)
