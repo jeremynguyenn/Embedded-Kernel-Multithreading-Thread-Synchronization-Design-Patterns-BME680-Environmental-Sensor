@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * bme680_i2c.c - I2C driver for Bosch BME680 environmental sensor
- *
- * Copyright (C) 2025 Your Name <your.email@example.com>
- *
+ * *
  * This driver provides I2C communication for the BME680 sensor, interfacing
  * with the core driver (bme680.c) using regmap. It supports Device Tree probing,
  * lockdep for synchronization, and robust error handling.
