@@ -13,7 +13,7 @@ This project provides a **Linux kernel module** and **user-space application** f
 - **Scalability**: Configurable thread counts, pipeline stages, and oversampling rates for varying workloads.
 - **Logging and Testing**: Comprehensive logging (`bme680.log`) and multithreaded test suite to validate performance and thread safety.
 - **IoT Integration**: Publishes data via pub/sub for integration with platforms like MQTT, Home Assistant, or AWS IoT.
-- **Educational Value**: Demonstrates kernel programming and multithreading patterns for teaching purposes.
+- **Educational Value**: Demonstrates advanced multithreading and kernel programming patterns for teaching purposes.
 
 ## Project Overview
 
@@ -109,12 +109,62 @@ package "User-Space" {
 [logger] #--> [bme680.log] : writes
 @enduml
 ```
+
 <img width="9180" height="4000" alt="image" src="https://github.com/user-attachments/assets/caefa16c-3e4f-489e-9ee8-0b840ca1549f" />
+
 
 **Explanation**:
 - **Kernel-Space**: `bme680` is the central driver, using `bme680_i2c` or `bme680_spi` for communication, `bme680_ipc` for alerts, and `bme680_config` for settings (protected by `rwlock`).
 - **User-Space**: `bme680_app` orchestrates all components, reading sensor data via `/dev/i2c-1`, processing through `thread_pool` and `assembly_line`, and publishing via `pubsub`. Synchronization is handled by `monitor`, `fifo_semaphore`, `event_pair`, `rwlock`, `recursive_mutex`, `barrier`, and `dining_philosophers`. `deadlock_detector` monitors for deadlocks, and `logger` records events.
 - **Relationships**: Arrows indicate dependencies or interactions (e.g., `bme680_app` uses `thread_pool` to dispatch tasks).
+
+## Các Khái Niệm Kỹ Thuật Được Bao Quát (Covered Technical Concepts - Explained in Vietnamese)
+
+Dự án này bao quát nhiều khái niệm cốt lõi trong lập trình hệ thống và đa luồng, đặc biệt là các chuẩn POSIX. Dưới đây là giải thích chi tiết bằng tiếng Việt về từng khái niệm, và liệu dự án có triển khai chúng không. Các khái niệm được nhóm theo chủ đề bạn đề cập.
+
+### File Operation, System Call, Library Functions, Compiling Using GNU-GCC, Blocking and Non-Blocking Call, Atomic Operation, Race Condition, User and Kernel Mode
+- **File Operation (Thao tác với file)**: Dự án sử dụng các hàm như `open()`, `read()`, `write()`, `ioctl()` trong `bme680_app.c` để mở và đọc/ghi dữ liệu từ thiết bị `/dev/i2c-1`. `logger.c` sử dụng `fopen()`, `fwrite()`, `fclose()` để ghi log vào file `bme680.log`. Đây là các thao tác file cơ bản theo chuẩn POSIX.
+- **System Call (Lời gọi hệ thống)**: Có sử dụng `fork()` trong `fork_handler.c`, `open()`, `ioctl()` trong `bme680_app.c`, và `sysconf()` để lấy số CPU. Trong kernel-space, các hàm như `regmap_read()` ngầm gọi system calls.
+- **Library Functions (Hàm thư viện)**: Dự án dùng nhiều hàm thư viện POSIX như `malloc()`, `free()` (stdlib.h), `pthread_create()` (pthread.h), `snprintf()` (stdio.h), `usleep()` (unistd.h).
+- **Compiling Using GNU-GCC (Biên dịch bằng GNU-GCC)**: `Makefile` sử dụng `gcc` để biên dịch user-space app (`bme680_app.c`, v.v.) với flags như `-pthread`, `-lrt`. Kernel modules được biên dịch bằng kernel build system nhưng tương thích GCC.
+- **Blocking and Non-Blocking Call (Lời gọi chặn và không chặn)**: Blocking calls: `pthread_cond_wait()`, `pthread_mutex_lock()` trong `rwlock.c`, `fifo_semaphore.c`. Non-blocking: `pthread_cond_timedwait()`, `pthread_mutex_timedlock()` với timeout 5s để tránh chặn vĩnh viễn.
+- **Atomic Operation (Thao tác nguyên tử)**: Dự án sử dụng mutex/spinlock để đảm bảo atomicity (ví dụ: `mutex_lock()` trong `bme680.c`, `pthread_mutex_lock()` trong `pubsub.c`). Tuy nhiên, không dùng trực tiếp `__atomic_*` (GCC) hoặc `atomic_t` (kernel).
+- **Race Condition (Tình trạng tranh chấp)**: Ngăn chặn bằng mutex (`pthread_mutex_t` trong `monitor.c`), rwlock (`rwlock.c`), và deadlock_detector (`deadlock_detector.c`).
+- **User and Kernel Mode (Chế độ người dùng và nhân)**: User mode: `bme680_app.c`, `thread_pool.c` chạy ở user-space. Kernel mode: `bme680.c`, `bme680_i2c.c` chạy trong kernel, giao tiếp qua `/dev/i2c-1` và `ioctl()`.
+
+### Process Management - Process Creation, Termination, Fork() System Call, Child-Parent Process, Command Line Argument of Process, Memory Layout of Process
+- **Process Creation (Tạo process)**: Sử dụng `fork()` trong `fork_handler.c` để tạo child process trong môi trường đa luồng.
+- **Process Termination (Kết thúc process)**: `exit()` trong child process (`fork_handler.c`), và graceful shutdown qua flag `running` trong `bme680_app.c`.
+- **Fork() System Call (Lời gọi fork())**: Triển khai trong `fork_handler.c`, với cleanup threads trong child để tránh zombie threads.
+- **Child-Parent Process (Process con-cha)**: `fork_handler.c` quản lý quan hệ cha-con, child process thực hiện tasks riêng và thoát sạch sẽ.
+- **Command Line Argument of Process (Tham số dòng lệnh của process)**: Xử lý `argc`, `argv` trong `main()` của `bme680_app.c` để cấu hình (ví dụ: `-i`, `-t`, `-s`).
+- **Memory Layout of Process (Bố cục bộ nhớ của process)**: Heap được quản lý qua `malloc()`/`free()` (ví dụ: `monitor.c`). Stack cho local variables, code/data segments qua biên dịch. Tuy nhiên, không minh họa chi tiết qua `/proc/<pid>/maps`.
+
+### Signals - Signal Handlers, Sending Signals to Process, Default Signal Handlers
+- **Signal Handlers (Xử lý tín hiệu)**: Dự án không triển khai `signal()` hoặc `sigaction()` để xử lý signals (như SIGINT, SIGTERM).
+- **Sending Signals to Process (Gửi tín hiệu đến process)**: Không sử dụng `kill()` hoặc `raise()` để gửi signals.
+- **Default Signal Handlers (Xử lý tín hiệu mặc định)**: Không can thiệp vào default handlers (ví dụ: SIGINT mặc định khi nhấn Ctrl+C).
+
+### POSIX Threads - Thread Creation, Thread Termination, Thread ID, Joinable and Detachable Threads
+- **Thread Creation (Tạo thread)**: `pthread_create()` trong `thread_pool.c`, `timer.c`, `assembly_line.c`.
+- **Thread Termination (Kết thúc thread)**: `pthread_join()`, `pthread_cancel()` trong `thread_pool_destroy()`, `timer_destroy()`.
+- **Thread ID (ID thread)**: `pthread_self()` trong `bme680_app.c` để lấy ID thread.
+- **Joinable and Detachable Threads (Thread có thể join và tách rời)**: Tất cả threads là joinable (`pthread_join()`), không dùng detachable (`PTHREAD_CREATE_DETACHED`).
+
+### Thread Synchronisation - Mutex, Condition Variables
+- **Mutex (Mutex)**: `pthread_mutex_t` trong `pubsub.c`, `monitor.c`. Recursive mutex trong `recursive_mutex.c`.
+- **Condition Variables (Biến điều kiện)**: `pthread_cond_t` và `pthread_cond_timedwait()` trong `rwlock.c`, `thread_pool.c`, `event_pair.c`.
+
+### Inter Process Communication (IPC) - Pipes, FIFO, POSIX Message Queue, POSIX Semaphore, POSIX Shared Memory
+- **Pipes (Ống dẫn)**: Không triển khai.
+- **FIFO (FIFO)**: Không triển khai named pipes (`mkfifo()`).
+- **POSIX Message Queue (Hàng đợi tin nhắn POSIX)**: Không triển khai `mq_open()`, `mq_send()`.
+- **POSIX Semaphore (Semaphore POSIX)**: Không dùng `sem_open()`, `sem_wait()`, nhưng `ipc_sync.c` dùng System V semaphores (`semget()`, `semop()`), tương đương chức năng.
+- **POSIX Shared Memory (Bộ nhớ chia sẻ POSIX)**: Không triển khai `shm_open()`, `mmap()`.
+
+### Memory Management - Process Virtual Memory Management, Memory Segments (Code, Data, Stack, Heap)
+- **Process Virtual Memory Management (Quản lý bộ nhớ ảo của process)**: Quản lý heap qua `malloc()`/`free()` trong `monitor.c`, `thread_pool.c`.
+- **Memory Segments (Phân đoạn bộ nhớ)**: Code (mã biên dịch), Data (biến toàn cục), Stack (biến cục bộ), Heap (`malloc()`). Không minh họa chi tiết.
 
 ## Installation and Usage
 
