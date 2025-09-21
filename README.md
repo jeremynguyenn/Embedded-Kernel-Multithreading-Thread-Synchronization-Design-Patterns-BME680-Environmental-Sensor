@@ -109,6 +109,7 @@ package "User-Space" {
 [logger] #--> [bme680.log] : writes
 @enduml
 ```
+<img width="9180" height="4000" alt="image" src="https://github.com/user-attachments/assets/caefa16c-3e4f-489e-9ee8-0b840ca1549f" />
 
 **Explanation**:
 - **Kernel-Space**: `bme680` is the central driver, using `bme680_i2c` or `bme680_spi` for communication, `bme680_ipc` for alerts, and `bme680_config` for settings (protected by `rwlock`).
